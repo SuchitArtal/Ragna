@@ -51,6 +51,85 @@ A repository-level code understanding assistant that:
 ## 📁 Project Structure
 
 ```
+
+---
+
+## 🚩 Phase 2: Deterministic Agent Loop (Added)
+
+This repository now contains a prototype deterministic agent loop that performs
+repeatable, safe analysis of the repository and can produce structured edit
+proposals (it does not apply edits automatically).
+
+What was implemented
+- `app/retrieval/agent_loop.py` — the AgentLoop class and `EditProposal` dataclass
+   - Tools implemented: `search_file(query)`, `read_file(path)`,
+      `analyze_dependencies(path)`, `propose_edit(file_path, modification_description)`
+   - Deterministic loop logic (think → choose tool → observe → update plan)
+   - Logging of every step via `agent.log` and Python `logging`
+   - Safety: `max_steps` and `max_recursion` to prevent infinite loops
+   - Returns structured `EditProposal` objects (with `to_json()`)
+
+Files added for the demo and testing
+- `scripts/run_agent_demo.py` — creates a temporary workspace, runs the agent,
+   prints the proposal JSON and agent logs (safe, read-only)
+- `test_agent_loop.py` — pytest unit test that verifies a proposal is created
+
+How the agent behaves (simple summary)
+- The agent turns the task description into search tokens.
+- It searches files deterministically for tokens, reads the first match,
+   and inspects it for TODO/FIXME or missing local imports.
+- If it finds a decisive issue, it returns an `EditProposal` describing what
+   to change; otherwise it rotates tokens and repeats until `max_steps`.
+
+Run the demo (safe, read-only)
+
+1. Ensure your virtual environment is active (see Setup above).
+
+2. Run the demo script:
+
+```bash
+python3 scripts/run_agent_demo.py
+```
+
+You should see a printed JSON edit proposal and a short agent log showing
+what tools were invoked.
+
+Programmatic usage example
+
+```python
+from app.retrieval.agent_loop import AgentLoop
+
+agent = AgentLoop(workspace_root='path/to/workspace', max_steps=20)
+result = agent.run_task('describe task here')
+if result.get('solved'):
+      proposal = result['proposal']  # EditProposal instance
+      print(proposal.to_json())
+else:
+      print('No proposal; task not solved.')
+```
+
+Testing (unit tests)
+
+Run the new test that exercises the agent loop:
+
+```bash
+pytest -q test_agent_loop.py
+```
+
+The test creates a temp workspace with a file containing `TODO` and ensures the
+agent returns a proposal.
+
+Notes and next steps
+- The current `analyze_dependencies` is a simple regex scanner; for robust
+   dependency analysis we can switch to Python's AST parsing.
+- `propose_edit` currently builds a minimal append suggestion. If you want
+   line-level patches or an apply helper (with backups/dry-run), I can add it.
+- The loop is intentionally deterministic and conservative — it's a safe,
+   review-first prototype.
+
+If you want me to: I can implement an `apply_proposal()` helper that writes
+changes to disk (with backup) and add tests for rollback and idempotency.
+
 Ragna/
 ├── app/
 │   └── retrieval/

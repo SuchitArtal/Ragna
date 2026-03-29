@@ -154,87 +154,132 @@ Ragna/
 
 ---
 
-## 🚀 Setup
 
-### Prerequisites
+## 🚀 Quickstart (for absolute beginners)
 
-- Python 3.8+
-- Git
+Follow these steps to set up the project locally and run the safe agent + sandbox demo.
 
-### Installation
-
-1. **Clone the repository**
-
-   ```bash
-   git clone <repo-url>
-   cd Ragna
-   ```
-
-2. **Create virtual environment**
-
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # Linux/Mac
-   venv\Scripts\activate     # Windows
-   ```
-
-3. **Install dependencies**
-
-   ```bash
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-
-4. **Configure test repository**
-
-   Edit `test_config.py`:
-
-   ```python
-   REPO_PATH = r"path/to/your/code/repository"
-   ```
-
----
-
-## 🧪 Usage
-
-### Test Repository Loading
+1) Clone the repository and open a terminal in the project root
 
 ```bash
-python test_loader.py
+git clone <repo-url>
+cd Ragna
 ```
 
-Loads and scans repository files.
+2) Create and activate a Python virtual environment
 
-### Test Code Parsing
+macOS / Linux
 
 ```bash
-python test_parser.py
+python3 -m venv venv
+source venv/bin/activate
 ```
 
-Parses code into functions, classes, and methods.
+Windows (PowerShell)
 
-### Test Embeddings
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+```
+
+3) Install Python dependencies
 
 ```bash
-python test_embed.py
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-Generates vector embeddings for code chunks.
+4) Run the demo agent (safe, read-only)
 
-### Test Semantic Search
+This script runs a deterministic demo agent that scans a temporary workspace and prints a proposed edit (it does not modify files on disk):
 
 ```bash
-python test_faiss.py
+python3 scripts/run_agent_demo.py
 ```
 
-Performs semantic search over repository code.
+5) Run the sandbox flow smoke test (CI-friendly, does not require Docker)
 
-**Example Output:**
+This test validates the full flow: agent proposal -> validation -> in-memory patch application. The test uses a mocked Docker manager so you can run it without Docker.
+
+```bash
+pytest -q tests/test_sandbox_flow.py
+```
+
+6) (Optional) Run the full test suite
+
+Some tests require additional system-level dependencies (Docker, sentence-transformers). If you installed those, run:
+
+```bash
+pytest -q
+```
+
+## � Docker & sandbox execution
+
+The sandbox executes validated proposals inside a Docker container to produce a true runtime validation. If Docker is not running or available the executor will still apply the patch in memory and return the validation results along with a helpful Docker error.
+
+To enable Docker-backed execution on macOS:
+
+1. Install Docker Desktop: https://www.docker.com/products/docker-desktop
+2. Start Docker Desktop (open the app or run `open -a Docker`).
+3. Wait until Docker indicates it is "running" (whale icon status).
+4. Optionally pre-pull the Python image used by tests:
+
+```bash
+docker pull python:3.11
+```
+
+Quick check commands:
+
+```bash
+docker info
+docker run --rm hello-world
+```
+
+If Docker can't be reached, you'll see an error like: "Cannot connect to the Docker daemon". The code handles this gracefully and surfaces the error in the executor output.
+
+## ✅ How the pieces fit together (high-level flow)
+
+1. Agent produces a proposal (JSON) with keys: `action`, `file_path`, `proposed_patch`, `reasoning`, `confidence`.
+2. `app/agents/agent_output.parse_agent_output(...)` validates the JSON schema and that `proposed_patch` is a unified-diff using `PatchParser`.
+3. `GuardrailPipeline.validate_edit(...)` performs patch parsing, file-path safety checks, secret scanning, and syntax simulation.
+4. `SandboxExecutor.execute_edit(repo_root, validated_proposal)` applies the patch in memory with `PatchApplier`. If guardrails allow, it attempts to run a container using `DockerManager` to execute a runtime command; it captures stdout/stderr and returns a structured result.
+
+## 🔧 Troubleshooting
+
+- If `pytest` fails due to missing `sentence_transformers`, either install the extra dependencies listed in `requirements.txt` or run only the focused sandbox test:
+
+```bash
+pytest -q tests/test_sandbox_flow.py
+```
+
+- If Docker commands fail with "Cannot connect to the Docker daemon": make sure Docker Desktop is running and you have necessary permissions. Restart Docker Desktop if required.
+
+- If you accidentally commit caches, add the following to `.gitignore`:
 
 ```
-Top results:
-connect_db db.py
-init_database main.py
+__pycache__/
+*.pyc
+.DS_Store
+```
+
+## 🧪 Developer commands (summary)
+
+Run demo (read-only):
+
+```bash
+python3 scripts/run_agent_demo.py
+```
+
+Run the sandbox smoke test (no Docker required):
+
+```bash
+pytest -q tests/test_sandbox_flow.py
+```
+
+Run the full suite (may require extra deps):
+
+```bash
+pytest -q
 ```
 
 ---

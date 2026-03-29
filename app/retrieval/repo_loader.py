@@ -33,6 +33,10 @@ DEFAULT_IGNORED_DIRS = {
     "dist",
 }
 
+# Maximum file size to consider for indexing (bytes). Files larger than this are skipped.
+# Keep a conservative default to avoid OOM when reading large binaries or minified bundles.
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+
 
 def load_repository(repo_path: str) -> List[Dict[str, str]]:
     """Load and scan a local repository.
@@ -93,6 +97,16 @@ def _iter_code_files(root: Path):
             try:
                 if _is_hidden_or_system(path) or _is_ignored(path):
                     logger.debug("Skipping path: %s", path)
+                    continue
+
+                # Skip very large files early to avoid reading them into memory
+                try:
+                    size = path.stat().st_size
+                    if size > MAX_FILE_SIZE:
+                        logger.info("Skipping large file %s (%d bytes)", path, size)
+                        continue
+                except (OSError, PermissionError) as exc:
+                    logger.warning("Could not stat file %s: %s", path, exc)
                     continue
 
                 if path.suffix.lower() in SUPPORTED_EXTENSIONS:

@@ -1,0 +1,16 @@
+[project]
+name = "ragna"
+version = "0.1.0"
+description = "Safe AI Coding Assistant with Guardrails and Sandbox Execution"
+authors = [
+    {name = "Your Name"}
+]
+dependencies = [
+    "typer",
+    "rich",
+    "sentence-transformers",
+    "faiss-cpu"
+]
+
+[project.scripts]
+ragna = "ragna.cli:app"

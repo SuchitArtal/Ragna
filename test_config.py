@@ -1,3 +1,3 @@
 # Central test configuration
 
-REPO_PATH = r"/Users/bhaktisn/Desktop/PhishScan/phishscan"
+REPO_PATH = r"D:\Ragna\demo_task_api"

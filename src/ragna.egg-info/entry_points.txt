@@ -1,0 +1,2 @@
+[console_scripts]
+ragna = ragna.cli:app

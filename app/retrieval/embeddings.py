@@ -11,6 +11,15 @@ logger = logging.getLogger(__name__)
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 DEFAULT_BATCH_SIZE = 32
+_MODEL_CACHE: Dict[str, SentenceTransformer] = {}
+
+
+def _get_model(model_name: str) -> SentenceTransformer:
+    """Return cached embedding model instance."""
+    if model_name not in _MODEL_CACHE:
+        logger.info("Loading embedding model: %s", model_name)
+        _MODEL_CACHE[model_name] = SentenceTransformer(model_name)
+    return _MODEL_CACHE[model_name]
 
 
 def embed_chunks(
@@ -18,6 +27,7 @@ def embed_chunks(
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     model_name: str = MODEL_NAME,
+    log_progress: bool = True,
 ) -> Tuple[List[List[float]], List[Dict[str, object]]]:
     """Embed parsed code chunks into vectors.
 
@@ -25,6 +35,7 @@ def embed_chunks(
         chunks: List of parsed chunk dictionaries.
         batch_size: Batch size for embedding.
         model_name: SentenceTransformer model name.
+        log_progress: Whether to emit per-batch progress logs.
 
     Returns:
         A tuple of (vectors, metadata) aligned by index.
@@ -32,8 +43,7 @@ def embed_chunks(
     if not chunks:
         return [], []
 
-    logger.info("Loading embedding model: %s", model_name)
-    model = SentenceTransformer(model_name)
+    model = _get_model(model_name)
 
     texts = [str(chunk.get("code", "")) for chunk in chunks]
     metadata = [
@@ -44,6 +54,7 @@ def embed_chunks(
             "name": chunk.get("name"),
             "class_name": chunk.get("class_name", ""),
             "function_name": chunk.get("function_name", ""),
+            "code": chunk.get("code", ""),
         }
         for chunk in chunks
     ]
@@ -53,7 +64,8 @@ def embed_chunks(
 
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
-        logger.info("Embedding chunks %d-%d of %d", start + 1, end, total)
+        if log_progress:
+            logger.info("Embedding chunks %d-%d of %d", start + 1, end, total)
         batch_vectors = model.encode(
             texts[start:end],
             batch_size=batch_size,
@@ -62,5 +74,6 @@ def embed_chunks(
         )
         vectors.extend(batch_vectors.tolist())
 
-    logger.info("Generated %d embeddings", len(vectors))
+    if log_progress:
+        logger.info("Generated %d embeddings", len(vectors))
     return vectors, metadata

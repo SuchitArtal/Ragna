@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shlex
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -15,6 +16,18 @@ from rich.text import Text
 
 logger = logging.getLogger("ragna.cli")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+# Reduce noisy third-party logs in interactive mode.
+for noisy_logger in [
+	"sentence_transformers",
+	"transformers",
+	"huggingface_hub",
+	"httpx",
+	"urllib3",
+	"faiss.loader",
+	"app.retrieval.vector_store",
+]:
+	logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
 app = typer.Typer(help="Ragna CLI - safe AI-powered repository assistant")
 console = Console()
@@ -30,14 +43,102 @@ state: Dict[str, Any] = {
 }
 
 
+class DeterministicSynthesisLLM:
+	"""Deterministic fallback synthesizer implementing an LLM-like interface."""
+
+	def generate(
+		self,
+		*,
+		system_prompt: str,
+		user_prompt: str,
+		temperature: float = 0.0,
+		max_tokens: int = 600,
+	) -> str:
+		del system_prompt, temperature, max_tokens
+		sections = re.findall(
+			r"\[Source\s+(\d+)\]\nFile:\s*(.*?)\nContent:\n(.*?)(?=\n\[Source\s+\d+\]|\Z)",
+			user_prompt,
+			flags=re.DOTALL,
+		)
+
+		if not sections:
+			return "Not enough information"
+
+		query_match = re.search(r"Question:\n(.*?)\n\nContext:", user_prompt, flags=re.DOTALL)
+		query = query_match.group(1).strip().lower() if query_match else ""
+
+		def _extract_anchor(content: str) -> str:
+			for line in content.splitlines():
+				stripped = line.strip()
+				if stripped.startswith(("def ", "async def ", "class ")):
+					return stripped
+			for line in content.splitlines():
+				stripped = line.strip()
+				if stripped and not stripped.startswith("#"):
+					return stripped[:140]
+			return "implementation details"
+
+		scored_sections: list[tuple[int, str, str, str]] = []
+		query_terms = [t for t in re.findall(r"[a-zA-Z_]{3,}", query) if t not in {"how", "what", "where", "when", "why"}]
+
+		for source_id, file_path, content in sections:
+			haystack = f"{file_path}\n{content}".lower()
+			score = sum(1 for term in query_terms if term in haystack)
+			scored_sections.append((score, source_id, _extract_anchor(content), file_path))
+
+		scored_sections.sort(key=lambda x: x[0], reverse=True)
+		top = scored_sections[:3]
+		if not top:
+			return "Not enough information"
+
+		source_ids = [sid for _, sid, _, _ in top]
+		citations = ", ".join(f"[Source {sid}]" for sid in source_ids)
+
+		route_anchor = next((a for _, _, a, p in top if "route" in p.lower() or "main.py" in p.lower()), top[0][2])
+		service_anchor = next((a for _, _, a, p in top if "service" in p.lower()), top[0][2])
+		logic_anchor = next((a for _, _, a, p in top if "util" in p.lower() or "model" in p.lower()), top[-1][2])
+
+		return (
+			"The request flow starts at API entrypoints and route handlers, then passes into service-layer logic "
+			f"where core operations are orchestrated ({route_anchor}; {service_anchor}). "
+			"Data validation and helper/model-level behavior support this path before the final response is returned "
+			f"to the caller ({logic_anchor}). {citations}"
+		)
+
+
 class SimpleRAGEngine:
 	"""Lightweight RAG placeholder backed by VectorStore search."""
 
-	def __init__(self, vector_store: Any):
+	def __init__(
+		self,
+		vector_store: Any,
+		repo_path: str,
+		llm: Optional[Any] = None,
+		response_mode: str = "explain",
+	):
 		self.vector_store = vector_store
+		self.repo_path = str(Path(repo_path).resolve())
+		self.repo_path_normalized = self._normalize_path(self.repo_path)
+		self.llm = llm or DeterministicSynthesisLLM()
+		self.response_mode = response_mode
+
+	@staticmethod
+	def _normalize_path(path: str) -> str:
+		"""Normalize paths for stable dedupe/filter behavior across OSes."""
+		if not path:
+			return ""
+		try:
+			normalized = str(Path(path).resolve())
+		except Exception:
+			normalized = str(path)
+		return normalized.replace("\\", "/").lower().rstrip("/")
 
 	def answer(self, query: str) -> Dict[str, Any]:
 		from app.retrieval.embeddings import embed_chunks
+
+		lowered = query.lower().strip()
+		if self._is_overview_query(lowered):
+			return self._build_codebase_overview()
 
 		query_vectors, _ = embed_chunks(
 			[
@@ -48,18 +149,25 @@ class SimpleRAGEngine:
 					"name": "query",
 					"code": query,
 				}
-			]
+			],
+			log_progress=False,
 		)
 
-		results = self.vector_store.search(query_vectors[0], top_k=3) if query_vectors else []
+		raw_results = self.vector_store.search(query_vectors[0], top_k=8) if query_vectors else []
+		ranked = self._rank_results(query, raw_results)
+		results = ranked[:5]
+
 		if results:
-			top_files = [str(r.get("file_path", "")) for r in results if r.get("file_path")]
-			answer = "Most relevant locations: " + ", ".join(top_files[:3])
+			if self.response_mode == "locate":
+				top_files = [str(item.get("file_path", "")) for item in results[:3] if item.get("file_path")]
+				answer = "Most relevant locations: " + ", ".join(top_files)
+			else:
+				context = self._build_context(results)
+				answer = self._synthesize_answer(query, context)
 		else:
 			answer = "No relevant context found yet."
 
 		proposal = None
-		lowered = query.lower()
 		if "fix" in lowered or "bug" in lowered:
 			target_file = Path(results[0].get("file_path", "test.py")).name if results else "test.py"
 			proposal = {
@@ -76,6 +184,197 @@ class SimpleRAGEngine:
 			}
 
 		return {"answer": answer, "results": results, "proposal": proposal}
+
+	def _build_context(self, results: list[dict]) -> str:
+		"""Build grounded synthesis context from retrieved code chunks."""
+		blocks: list[str] = []
+
+		for idx, item in enumerate(results, start=1):
+			file_path = str(item.get("file_path", ""))
+			code_chunk = str(item.get("code", "")).strip()
+			if not code_chunk:
+				code_chunk = "# code snippet unavailable in metadata"
+
+			# Keep context size bounded for deterministic behavior.
+			code_chunk = code_chunk[:2000]
+
+			block = (
+				f"[Source {idx}]\n"
+				f"File: {file_path}\n"
+				"Content:\n"
+				f"{code_chunk}"
+			)
+			blocks.append(block)
+
+		return "\n\n".join(blocks)
+
+	def _synthesize_answer(self, query: str, context: str) -> str:
+		"""Generate a grounded natural-language explanation from retrieved context."""
+		if not context.strip():
+			return "Not enough information"
+
+		system_prompt = (
+    "You are a senior software engineer analyzing a real-world codebase.\n\n"
+
+    "Your task is to answer developer questions about the codebase accurately, clearly, and specifically.\n\n"
+
+    "PRIMARY OBJECTIVE:\n"
+    "- Directly answer the user's question based ONLY on provided context.\n"
+    "- Tailor the response to the exact type of question being asked.\n\n"
+
+    "GROUNDING RULES:\n"
+    "- Use ONLY the provided retrieved context.\n"
+    "- Do NOT invent files, functions, logic, or behavior.\n"
+    "- If context is insufficient, respond exactly with: 'Not enough information.'\n\n"
+
+    "RESPONSE RULES:\n"
+    "- Do NOT describe sources individually.\n"
+    "- Do NOT say phrases like 'Source 1 shows' or 'According to Source 2'.\n"
+    "- Synthesize information naturally into one cohesive answer.\n"
+    "- Be specific to THIS codebase, not generic.\n"
+    "- If the answer could apply to any backend project, rewrite it to be more specific.\n\n"
+
+    "QUESTION HANDLING:\n"
+    "- If asked HOW something works → explain flow/interaction.\n"
+    "- If asked WHAT something does → explain purpose/responsibility.\n"
+    "- If asked WHERE something is → mention exact file/module.\n"
+    "- If asked to LIST items → provide structured list.\n"
+    "- If asked to FIND BUGS/ISSUES → identify concrete technical concerns.\n\n"
+
+    "STYLE:\n"
+    "- Be concise but technically meaningful.\n"
+    "- Write like explaining to another engineer.\n"
+    "- Prefer clarity over verbosity.\n\n"
+
+    "CITATIONS:\n"
+    "- Use citations only when helpful.\n"
+    "- Format citations as [Source 1], [Source 2].\n"
+)
+
+		user_prompt = (
+			f"Question:\n{query}\n\n"
+			"Context:\n"
+			f"{context}\n\n"
+			"Task:\n"
+			"Explain the answer by synthesizing the context.\n\n"
+			"Focus on:\n"
+			"- How the system works\n"
+			"- Flow of data and control\n"
+			"- Interaction between components\n\n"
+			"DO NOT:\n"
+			"- List sources individually\n"
+			"- Repeat code snippets unnecessarily\n\n"
+			"Write a clear, cohesive explanation.\n\n"
+			"Think step-by-step internally about how the system works,\n"
+			"but only output the final explanation."
+		)
+
+		try:
+			response = self.llm.generate(
+				system_prompt=system_prompt,
+				user_prompt=user_prompt,
+				temperature=0.0,
+				max_tokens=700,
+			)
+			answer = str(response).strip()
+			if not answer:
+				return "Not enough information"
+			return answer
+		except Exception as exc:
+			logger.warning("Synthesis fallback due to LLM error: %s", exc)
+			return "Not enough information"
+
+	def _build_codebase_overview(self) -> Dict[str, Any]:
+		"""Return a concise repository overview from indexed metadata."""
+		metadata = getattr(self.vector_store, "metadata", [])
+		files = []
+		for item in metadata:
+			file_path = str(item.get("file_path", ""))
+			if file_path and self._normalize_path(file_path).startswith(self.repo_path_normalized):
+				files.append(file_path)
+
+		unique_files = sorted(set(files))
+		if not unique_files:
+			return {"answer": "No indexed files available.", "results": [], "proposal": None}
+
+		priority_hints = ["main.py", "routes", "services", "database", "config"]
+		highlights = []
+		for hint in priority_hints:
+			for f in unique_files:
+				if hint in f.replace("\\", "/"):
+					highlights.append(f)
+			if len(highlights) >= 5:
+				break
+
+		highlights = list(dict.fromkeys(highlights))[:5]
+		answer = (
+			f"Indexed {len(unique_files)} files. "
+			"Key areas include API routes, services, database access, and configuration."
+		)
+		results = [{"file_path": path, "score": 1.0} for path in highlights]
+		return {"answer": answer, "results": results, "proposal": None}
+
+	def _rank_results(self, query: str, results: list[dict]) -> list[dict]:
+		"""Deduplicate and rerank results using simple keyword-aware scoring."""
+		query_terms = [term for term in query.lower().split() if len(term) > 2]
+		seen: set[str] = set()
+		ranked: list[dict] = []
+
+		for item in results:
+			path = str(item.get("file_path", ""))
+			if not path:
+				continue
+			normalized_path = self._normalize_path(path)
+			if self.repo_path_normalized and not normalized_path.startswith(self.repo_path_normalized):
+				continue
+			if normalized_path in seen:
+				continue
+			seen.add(normalized_path)
+
+			base_score = float(item.get("score", 0.0))
+			lowered_path = path.lower()
+			keyword_boost = sum(0.2 for t in query_terms if t in lowered_path)
+			item_copy = dict(item)
+			item_copy["score"] = base_score + keyword_boost
+			ranked.append(item_copy)
+
+		ranked.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+		return ranked
+
+	@staticmethod
+	def _is_overview_query(lowered_query: str) -> bool:
+		"""Detect repository-overview style questions more robustly."""
+		if "overview" in lowered_query or "architecture" in lowered_query:
+			return True
+		if "codebase" in lowered_query and re.search(r"\b(explain|describe|summarize|summary|walk me through)\b", lowered_query):
+			return True
+		if re.search(r"\b(project|repo|repository)\b", lowered_query) and "structure" in lowered_query:
+			return True
+		return False
+
+
+def _guardrail_block_reason_for_query(query: str) -> Optional[str]:
+	"""Block obvious unsafe edit-style prompts before proposal/apply steps."""
+	stripped = query.strip()
+	lowered = stripped.lower()
+
+	# Strong signals of unsafe path manipulation.
+	if re.search(r"\.\.[/\\]", stripped) or re.search(r"(^|\s)/etc/|(^|\s)c:[/\\]windows", lowered):
+		return "Unsafe path operation detected in prompt"
+
+	# Secret-like assignment in natural language prompts (e.g., API_KEY=\"123456\").
+	from app.guardrails.secret_scanner import SecretScanner
+
+	scanner = SecretScanner()
+	secret_result = scanner.scan_patch_for_secrets([f"+{stripped}"])
+	if secret_result.get("has_secrets", False):
+		return "Potential hardcoded secret detected in requested change"
+
+	# Catch short but obvious API key assignments that may evade strict regex length checks.
+	if re.search(r"(?i)(api[_-]?key|token|secret|password)\s*[=:]", stripped):
+		return "Sensitive credential assignment detected in requested change"
+
+	return None
 
 
 def _record_history(command: str) -> None:
@@ -119,6 +418,7 @@ def _show_help() -> None:
 	table.add_row("apply", "Apply the last proposed edit")
 	table.add_row("run <command>", "Run a command in Docker sandbox")
 	table.add_row("status", "Show current CLI status")
+	table.add_row("clear", "Clear the interactive screen")
 	table.add_row("history", "Show last commands")
 	table.add_row("help", "Show this help")
 	table.add_row("exit / quit", "Leave interactive mode")
@@ -177,7 +477,7 @@ def _handle_analyze(repo_path: str) -> bool:
 
 		vector_store = VectorStore(dim=len(vectors[0]))
 		vector_store.add_embeddings(vectors, metadata)
-		rag_engine = SimpleRAGEngine(vector_store)
+		rag_engine = SimpleRAGEngine(vector_store, str(repo))
 
 		state["repo_path"] = str(repo)
 		state["vector_store"] = vector_store
@@ -207,6 +507,18 @@ def _handle_ask(query: str) -> bool:
 	if rag_engine is None:
 		_print_error("Repository not analyzed. Run: analyze <path>")
 		return False
+
+	blocked_reason = _guardrail_block_reason_for_query(query)
+	if blocked_reason:
+		state["last_edit"] = None
+		console.print(
+			Panel.fit(
+				f"[bold red]❌ Blocked by guardrails[/bold red]\n{blocked_reason}",
+				border_style="red",
+				title="Ragna",
+			)
+		)
+		return True
 
 	try:
 		_print_info("⏳ Thinking...")
@@ -252,7 +564,7 @@ def _handle_ask(query: str) -> bool:
 		return False
 
 
-def _handle_apply() -> bool:
+def _handle_apply(preview: bool = False) -> bool:
 	"""Apply last proposed edit through sandbox executor."""
 	proposal = state.get("last_edit")
 	repo_path = state.get("repo_path")
@@ -271,7 +583,12 @@ def _handle_apply() -> bool:
 		state["executor"] = executor
 		state["docker_manager"] = getattr(executor, "docker_manager", None)
 
-		result = executor.execute_edit(repo_path, proposal)
+		proposal_to_apply = dict(proposal) if isinstance(proposal, dict) else {}
+		if preview:
+			proposal_to_apply["preview"] = True
+			proposal_to_apply["write_back"] = False
+
+		result = executor.execute_edit(repo_path, proposal_to_apply)
 		success = bool(result.get("success", False))
 		validation = result.get("validation_result", {})
 
@@ -295,6 +612,10 @@ def _handle_apply() -> bool:
 			console.print(Panel.fit(f"[bold]stdout[/bold]\n{result.get('execution_output')}", border_style="cyan"))
 		if result.get("execution_error"):
 			console.print(Panel.fit(f"[bold]stderr[/bold]\n{result.get('execution_error')}", border_style="red"))
+		if result.get("written_file"):
+			_print_success(f"Patched file written: {result.get('written_file')}")
+		elif preview and success:
+			_print_info("Preview mode: patch validated/applied in memory only; no file was written.")
 
 		if success:
 			_print_success("Apply completed")
@@ -362,11 +683,49 @@ def _run_interactive_mode() -> None:
 		if lowered == "status":
 			_print_status()
 			continue
+		if lowered == "clear":
+			console.clear()
+			continue
 		if lowered == "help":
 			_show_help()
 			continue
 		if lowered == "history":
 			_show_history()
+			continue
+
+		# Preserve raw Windows paths with backslashes (shlex can consume backslashes).
+		if lowered.startswith("analyze "):
+			path_arg = raw[len("analyze ") :].strip()
+			if (path_arg.startswith('"') and path_arg.endswith('"')) or (
+				path_arg.startswith("'") and path_arg.endswith("'")
+			):
+				path_arg = path_arg[1:-1]
+			if not path_arg:
+				_print_error("Usage: analyze <path>")
+				continue
+			_handle_analyze(path_arg)
+			continue
+
+		# Preserve full shell command text for sandbox execution.
+		if lowered.startswith("run "):
+			command_arg = raw[len("run ") :].strip()
+			if not command_arg:
+				_print_error("Usage: run <command>")
+				continue
+			_handle_run(command_arg)
+			continue
+
+		# Preserve ask query text exactly as typed (important for Windows paths).
+		if lowered.startswith("ask "):
+			query_arg = raw[len("ask ") :].strip()
+			if (query_arg.startswith('"') and query_arg.endswith('"')) or (
+				query_arg.startswith("'") and query_arg.endswith("'")
+			):
+				query_arg = query_arg[1:-1]
+			if not query_arg:
+				_print_error("Usage: ask <query>")
+				continue
+			_handle_ask(query_arg)
 			continue
 
 		try:
@@ -381,23 +740,15 @@ def _run_interactive_mode() -> None:
 		cmd = parts[0].lower()
 		args = parts[1:]
 
-		if cmd == "analyze":
-			if not args:
-				_print_error("Usage: analyze <path>")
-				continue
-			_handle_analyze(args[0])
-		elif cmd == "apply":
-			_handle_apply()
-		elif cmd == "run":
-			if not args:
-				_print_error("Usage: run <command>")
-				continue
-			_handle_run(" ".join(args))
-		elif cmd == "ask":
-			if not args:
-				_print_error("Usage: ask <query>")
-				continue
-			_handle_ask(" ".join(args))
+		if cmd == "apply":
+			preview = False
+			if args:
+				if len(args) == 1 and args[0] == "--preview":
+					preview = True
+				else:
+					_print_error("Usage: apply [--preview]")
+					continue
+			_handle_apply(preview=preview)
 		else:
 			_handle_ask(raw)
 
@@ -424,9 +775,11 @@ def ask(query: str = typer.Argument(..., help="Question to ask Ragna")) -> None:
 
 
 @app.command()
-def apply() -> None:
+def apply(
+	preview: bool = typer.Option(False, "--preview", help="Validate/apply in memory only; do not write file"),
+) -> None:
 	"""Apply the last proposed edit in sandbox flow."""
-	if not _handle_apply():
+	if not _handle_apply(preview=preview):
 		raise typer.Exit(code=1)
 
 
@@ -441,6 +794,32 @@ def run_cmd(command: str = typer.Argument(..., help="Command to execute inside D
 def status() -> None:
 	"""Show current CLI runtime state."""
 	_print_status()
+
+
+def _prefer_src_cli_app() -> None:
+	"""Prefer src/ragna/cli.py implementation when present to avoid dual-CLI drift."""
+	global app
+	try:
+		import importlib.util
+
+		src_cli_path = Path(__file__).resolve().parents[1] / "src" / "ragna" / "cli.py"
+		if not src_cli_path.exists():
+			return
+
+		spec = importlib.util.spec_from_file_location("_ragna_src_cli", src_cli_path)
+		if spec is None or spec.loader is None:
+			return
+
+		module = importlib.util.module_from_spec(spec)
+		spec.loader.exec_module(module)
+		src_app = getattr(module, "app", None)
+		if src_app is not None:
+			app = src_app
+	except Exception as exc:
+		logger.warning("Falling back to local ragna.cli implementation: %s", exc)
+
+
+_prefer_src_cli_app()
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Set
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,8 @@ class Hunk:
 
 class PatchParser:
 	"""Parse and validate unified diff patches."""
+
+	MAX_PATCH_LINES = 1200
 
 	def parse_patch(self, patch_text: str, file_path: str) -> Dict[str, object]:
 		"""Parse a unified diff patch into structured metadata.
@@ -38,6 +40,12 @@ class PatchParser:
 			logger.warning("Empty patch text for %s", file_path)
 			return self._invalid_result(file_path, raw_patch)
 
+		if len(lines) > self.MAX_PATCH_LINES:
+			logger.warning("Patch too large (%d lines) for %s", len(lines), file_path)
+			result = self._invalid_result(file_path, raw_patch)
+			result["error"] = f"Patch exceeds max allowed lines ({self.MAX_PATCH_LINES})"
+			return result
+
 		try:
 			header_index = self._find_header_index(lines)
 			if header_index < 0 or header_index + 1 >= len(lines):
@@ -48,6 +56,7 @@ class PatchParser:
 				logger.warning("Malformed unified diff headers for %s", file_path)
 				return self._invalid_result(file_path, raw_patch)
 
+			files_touched = self._extract_files_touched(lines)
 			hunks = self._extract_hunks(lines[header_index + 2 :])
 			if not hunks:
 				logger.warning("No hunks found in patch for %s", file_path)
@@ -60,8 +69,12 @@ class PatchParser:
 				"file_path": file_path,
 				"is_valid_format": True,
 				"hunks": [h.__dict__ for h in hunks],
+				"hunk_count": len(hunks),
 				"added_line_count": added_line_count,
 				"removed_line_count": removed_line_count,
+				"files_touched": sorted(files_touched),
+				"touches_multiple_files": len(files_touched) > 1,
+				"targets_declared_file": self._targets_declared_file(files_touched, file_path),
 				"raw_patch": raw_patch,
 			}
 		except ValueError as exc:
@@ -98,13 +111,36 @@ class PatchParser:
 
 		return hunks
 
+	def _extract_files_touched(self, lines: List[str]) -> Set[str]:
+		"""Extract touched files from ---/+++ headers."""
+		files: Set[str] = set()
+		for line in lines:
+			if line.startswith("--- ") or line.startswith("+++ "):
+				path = line[4:].strip()
+				if path in {"/dev/null", ""}:
+					continue
+				if path.startswith("a/") or path.startswith("b/"):
+					path = path[2:]
+				files.add(path.replace("\\", "/"))
+		return files
+
+	def _targets_declared_file(self, files_touched: Set[str], file_path: str) -> bool:
+		if not files_touched:
+			return False
+		declared = (file_path or "").replace("\\", "/").lstrip("./")
+		return declared in files_touched
+
 	def _invalid_result(self, file_path: str, raw_patch: str) -> Dict[str, object]:
 		return {
 			"file_path": file_path,
 			"is_valid_format": False,
 			"hunks": [],
+			"hunk_count": 0,
 			"added_line_count": 0,
 			"removed_line_count": 0,
+			"files_touched": [],
+			"touches_multiple_files": False,
+			"targets_declared_file": False,
 			"raw_patch": raw_patch,
 		}
 

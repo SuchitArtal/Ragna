@@ -24,6 +24,7 @@ class DockerManager:
             mount_target: Container path where repository is mounted.
         """
         self.mount_target = mount_target
+        self.default_timeout_sec = 45
         logger.debug("DockerManager initialized")
 
     def create_container(self, image: str, repo_path: str) -> Dict[str, object]:
@@ -52,8 +53,19 @@ class DockerManager:
             "run",
             "-d",
             "--rm",
+            "--network",
+            "none",
+            "--cpus",
+            "1.0",
+            "--memory",
+            "512m",
+            "--pids-limit",
+            "128",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,size=64m",
             "-v",
-            f"{host_repo}:{self.mount_target}",
+            f"{host_repo}:{self.mount_target}:ro",
             "-w",
             self.mount_target,
             image,
@@ -62,7 +74,7 @@ class DockerManager:
             "/dev/null",
         ]
 
-        completed = self._run_cli(cmd)
+        completed = self._run_cli(cmd, timeout_sec=self.default_timeout_sec)
         if completed["ok"]:
             container_id = completed["stdout"].strip()
             return {
@@ -96,7 +108,7 @@ class DockerManager:
         """
         logger.info("Running command in container=%s", container_id)
         cmd = ["docker", "exec", container_id, "sh", "-lc", command]
-        completed = self._run_cli(cmd)
+        completed = self._run_cli(cmd, timeout_sec=self.default_timeout_sec)
 
         return {
             "ran": completed["ok"],
@@ -116,12 +128,12 @@ class DockerManager:
             Cleanup status result.
         """
         logger.info("Stopping/removing container id=%s", container_id)
-        stop_result = self._run_cli(["docker", "stop", container_id])
+        stop_result = self._run_cli(["docker", "stop", container_id], timeout_sec=20)
         # With `docker run --rm`, successful `docker stop` auto-removes container.
         # Only call `docker rm` when stop did not succeed.
         rm_result = {"ok": True, "stdout": "", "stderr": "", "exit_code": 0}
         if not stop_result["ok"]:
-            rm_result = self._run_cli(["docker", "rm", container_id], log_errors=False)
+            rm_result = self._run_cli(["docker", "rm", container_id], log_errors=False, timeout_sec=20)
 
         stop_missing = self._is_no_such_container(stop_result.get("stderr", ""))
         rm_missing = self._is_no_such_container(rm_result.get("stderr", ""))
@@ -143,7 +155,7 @@ class DockerManager:
         message = (stderr or "").lower()
         return "no such container" in message
 
-    def _run_cli(self, command: list[str], log_errors: bool = True) -> Dict[str, object]:
+    def _run_cli(self, command: list[str], log_errors: bool = True, timeout_sec: int | None = None) -> Dict[str, object]:
         """Execute docker CLI command and capture outputs."""
         try:
             proc = subprocess.run(
@@ -151,6 +163,7 @@ class DockerManager:
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=timeout_sec,
             )
             stdout = proc.stdout.strip()
             stderr = proc.stderr.strip()
@@ -162,6 +175,15 @@ class DockerManager:
                 "stdout": stdout,
                 "stderr": stderr,
                 "exit_code": proc.returncode,
+            }
+        except subprocess.TimeoutExpired:
+            msg = f"Docker command timed out after {timeout_sec or self.default_timeout_sec}s"
+            logger.error(msg)
+            return {
+                "ok": False,
+                "stdout": "",
+                "stderr": msg,
+                "exit_code": 124,
             }
         except FileNotFoundError:
             msg = "Docker CLI not found. Ensure Docker is installed and on PATH."

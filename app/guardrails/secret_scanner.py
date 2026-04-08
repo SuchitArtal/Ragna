@@ -17,7 +17,7 @@ class SecretScanner:
         "aws_access_key": re.compile(r"AKIA[0-9A-Z]{16}", re.IGNORECASE),
         "aws_secret_key": re.compile(r"['\"]([A-Za-z0-9/+=]{40})['\"]"),
         "generic_api_key": re.compile(
-            r"(?i)(api[_-]?key|apikey|api_key)\s*[=:]\s*['\"]?([a-zA-Z0-9_\-]{16,})['\"]?"
+            r"(?i)(api[_-]?key|apikey|api_key)\s*[=:]\s*['\"]?([a-zA-Z0-9_\-]{6,})['\"]?"
         ),
         "bearer_token": re.compile(
             r"(?i)bearer\s+[A-Za-z0-9\-\._~\+\/]+=*"

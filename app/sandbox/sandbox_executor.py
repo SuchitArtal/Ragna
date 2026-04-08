@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Dict
 
@@ -67,22 +68,36 @@ class SandboxExecutor:
                 str(edit_proposal.get("proposed_patch", "")),
             )
 
-            # Future enhancement: run command against staged patched workspace.
-            # Current behavior executes command in mounted repository container.
-            image = str(edit_proposal.get("docker_image", "python:3.11"))
-            command = str(edit_proposal.get("execution_command", "python --version"))
             execution_output = ""
             execution_error = ""
+            write_back_enabled = bool(edit_proposal.get("write_back", True))
+            preview_only = bool(edit_proposal.get("preview", False))
 
-            container_result = self.docker_manager.create_container(image=image, repo_path=repo_root)
-            if not container_result.get("created", False):
-                execution_error = "; ".join(container_result.get("errors", []))
-            else:
-                container_id = str(container_result.get("container_id", ""))
-                run_result = self.docker_manager.run_command(container_id, command)
-                execution_output = str(run_result.get("stdout", ""))
-                execution_error = str(run_result.get("stderr", ""))
-                self.docker_manager.stop_container(container_id)
+            run_command = str(edit_proposal.get("execution_command", "")).strip()
+            run_in_docker = bool(edit_proposal.get("run_in_docker", False))
+            run_tests = bool(edit_proposal.get("run_tests", False))
+            if run_tests and not run_command:
+                run_command = str(edit_proposal.get("test_command", "pytest -q"))
+                run_in_docker = bool(edit_proposal.get("run_tests_in_docker", True))
+            if run_in_docker and run_command:
+                image = str(edit_proposal.get("docker_image", "python:3.11"))
+                container_result = self.docker_manager.create_container(image=image, repo_path=repo_root)
+                if not container_result.get("created", False):
+                    execution_error = "; ".join(container_result.get("errors", []))
+                else:
+                    container_id = str(container_result.get("container_id", ""))
+                    run_result = self.docker_manager.run_command(container_id, run_command)
+                    execution_output = str(run_result.get("stdout", ""))
+                    execution_error = str(run_result.get("stderr", ""))
+                    self.docker_manager.stop_container(container_id)
+
+            written_file = ""
+            if not execution_error and write_back_enabled and not preview_only:
+                full_path.write_text(patched_code, encoding="utf-8")
+                written_file = str(full_path)
+                logger.info("Patched file written to repository: %s", written_file)
+            elif preview_only:
+                logger.info("Preview mode enabled; patch not written for %s", file_path)
 
             logger.info("Sandbox patch apply succeeded for %s", file_path)
 
@@ -92,6 +107,11 @@ class SandboxExecutor:
                 "patched_code": patched_code,
                 "execution_output": execution_output,
                 "execution_error": execution_error,
+                "write_back": write_back_enabled and not preview_only,
+                "preview": preview_only,
+                "written_file": written_file,
+                "tests_ran": run_tests,
+                "command_ran": run_command,
                 "validation_result": validation_result,
             }
         except Exception as exc:
@@ -155,6 +175,13 @@ class SandboxExecutor:
         """Resolve and enforce repository-bounded file path."""
         root = Path(repo_root).expanduser().resolve()
         target = (root / file_path).resolve()
+
+        # Fallback: if proposal uses short path (e.g., "auth.py"), try repo_root/app/<file>.
+        if not target.exists():
+            alt_path = Path(os.path.join(str(root), "app", file_path)).resolve()
+            if alt_path.exists():
+                target = alt_path
+
         try:
             target.relative_to(root)
         except ValueError as exc:

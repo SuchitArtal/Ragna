@@ -25,11 +25,13 @@ class SyntaxValidator:
         errors: List[str] = []
 
         try:
-            ast.parse(patched_code)
+            tree = ast.parse(patched_code)
+            warnings = self._check_python_import_sanity(tree)
             logger.info("Syntax validation passed for %s", file_path)
             return {
                 "valid": True,
                 "errors": [],
+                "warnings": warnings,
             }
         except SyntaxError as exc:
             error_msg = f"Line {exc.lineno}: {exc.msg}"
@@ -38,6 +40,7 @@ class SyntaxValidator:
             return {
                 "valid": False,
                 "errors": errors,
+                "warnings": [],
             }
         except Exception as exc:
             error_msg = f"Validation failed: {str(exc)}"
@@ -46,6 +49,7 @@ class SyntaxValidator:
             return {
                 "valid": False,
                 "errors": errors,
+                "warnings": [],
             }
 
     def validate_syntax(self, patched_code: str, file_path: str, language: str) -> Dict[str, object]:
@@ -67,4 +71,17 @@ class SyntaxValidator:
         return {
             "valid": True,
             "errors": [],
+            "warnings": ["Static syntax checks skipped for non-Python file"],
         }
+
+    def _check_python_import_sanity(self, tree: ast.AST) -> List[str]:
+        warnings: List[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.module is None and node.level == 0:
+                    warnings.append("Suspicious import-from statement without module")
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if not alias.name or alias.name.strip() == ".":
+                        warnings.append("Suspicious empty import name")
+        return warnings

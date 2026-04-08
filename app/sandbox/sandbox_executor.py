@@ -70,6 +70,8 @@ class SandboxExecutor:
 
             execution_output = ""
             execution_error = ""
+            # Preview mode keeps the patch in memory only so we can validate behavior
+            # without mutating the repository during a dry run.
             write_back_enabled = bool(edit_proposal.get("write_back", True))
             preview_only = bool(edit_proposal.get("preview", False))
 
@@ -80,6 +82,8 @@ class SandboxExecutor:
                 run_command = str(edit_proposal.get("test_command", "pytest -q"))
                 run_in_docker = bool(edit_proposal.get("run_tests_in_docker", True))
             if run_in_docker and run_command:
+                # Docker is optional and only used when the proposal explicitly requests
+                # an isolated runtime command such as tests or linting.
                 image = str(edit_proposal.get("docker_image", "python:3.11"))
                 container_result = self.docker_manager.create_container(image=image, repo_path=repo_root)
                 if not container_result.get("created", False):
@@ -93,6 +97,8 @@ class SandboxExecutor:
 
             written_file = ""
             if not execution_error and write_back_enabled and not preview_only:
+                # Controlled write-back is the final step: the file is only persisted after
+                # validation and any requested sandbox execution have succeeded.
                 full_path.write_text(patched_code, encoding="utf-8")
                 written_file = str(full_path)
                 logger.info("Patched file written to repository: %s", written_file)

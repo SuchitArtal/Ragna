@@ -46,6 +46,8 @@ class QueryControlPipeline:
         if len(text) < 3:
             return QueryValidationResult(False, "Query is too short. Add details.")
 
+        # Reject vague prompts early so the assistant can ask for the missing file/module
+        # instead of guessing and producing a broad or incorrect answer.
         vague_patterns = [
             r"^fix\s+it$",
             r"^change\s+auth$",
@@ -60,6 +62,8 @@ class QueryControlPipeline:
                 requires_clarification=True,
             )
 
+        # Block command-like instructions that could be misread as a request to execute
+        # destructive shell actions rather than analyze or edit code.
         if re.search(r"(^|\s)(rm\s+-rf|del\s+/s|format\s+c:|shutdown\s+/s)", text.lower()):
             return QueryValidationResult(
                 valid=False,
@@ -71,6 +75,8 @@ class QueryControlPipeline:
 
     def detect_intent(self, query: str) -> str:
         q = query.lower()
+        # Intent routing is intentionally simple and deterministic so the demo can explain
+        # why a query was treated as list, locate, security review, or general explain.
         if any(k in q for k in ["compare", "vs", "difference", "tradeoff"]):
             return "compare"
         if any(k in q for k in ["summarize", "summary", "overview"]):
@@ -99,6 +105,8 @@ class QueryControlPipeline:
         q = query.strip()
         candidates: List[str] = []
 
+        # Extract raw filesystem paths and module-like references first so Windows paths
+        # survive intact and can override generic semantic retrieval.
         path_patterns = [
             r"([A-Za-z]:\\[^\s'\"]+\.[A-Za-z0-9_]+)",
             r"(\.?\.?/[\w./-]+\.[A-Za-z0-9_]+)",
@@ -125,7 +133,8 @@ class QueryControlPipeline:
                 resolved.append(known_norm[raw_norm])
                 continue
 
-            # basename/module fallback
+            # Basename fallback lets the assistant resolve user-friendly references like
+            # "check_config.js" even when the query omits the full absolute path.
             basename = Path(raw.replace("\\", "/")).name.lower()
             for p in known_paths:
                 if Path(p.replace("\\", "/")).name.lower() == basename:

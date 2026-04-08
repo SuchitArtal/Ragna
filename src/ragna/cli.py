@@ -334,7 +334,8 @@ class SimpleRAGEngine:
         raw_results = self.vector_store.search(query_vectors[0], top_k=20) if query_vectors else []
         ranked = self._rank_results(query, raw_results, intent=intent, explicit_targets=explicit_targets)
 
-        # File-scoping: prioritize and restrict to explicit target first.
+        # File-scoping: prioritize the explicit target first so the answer stays grounded
+        # in the exact file the user named, instead of drifting to semantically similar files.
         scoped_results = ranked
         if explicit_targets:
             scoped_results = [
@@ -344,7 +345,8 @@ class SimpleRAGEngine:
                 scoped_results = self._file_fallback_results(explicit_targets)
 
         if explicit_targets:
-            # Strict mode: do not mix unrelated files when user explicitly asks for a path.
+            # Strict mode: never mix unrelated files into the answer when the user supplied
+            # an explicit path. This is the main anti-wrong-file safeguard for demos.
             results = scoped_results[:8]
         else:
             results = self._expand_multihop_results(query, scoped_results[:10])[:8]
@@ -372,6 +374,8 @@ class SimpleRAGEngine:
                     fallback = self._list_routes_from_index()
                     if fallback:
                         answer = fallback
+                # If synthesis is still too generic, use a deterministic file-specific fallback
+                # so explicit-path queries always produce something rooted in the target file.
                 if answer.strip().lower() in {
                     "not enough information",
                     "not enough information.",
@@ -384,6 +388,7 @@ class SimpleRAGEngine:
         if "request flow starts" in answer.lower():
             answer += "\n\n[Warning: answer may be too generic]"
 
+        # Build a patch proposal only from the same scoped context used for the answer.
         proposal = self._build_fix_proposal(query, results, explicit_targets=explicit_targets)
 
         answer_validation = self.controls.validate_answer(answer, query, results)
